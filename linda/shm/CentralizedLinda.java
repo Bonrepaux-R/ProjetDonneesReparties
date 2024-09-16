@@ -4,10 +4,12 @@ import linda.Callback;
 import linda.Linda;
 import linda.Tuple;
 import java.util.*;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+import javax.management.monitor.Monitor;
 
 
 /** Shared memory implementation of Linda. */
@@ -16,9 +18,20 @@ public class CentralizedLinda implements Linda {
     private Map<Integer,List<Tuple>> tuplespace;  //liste des tuples en mémoire partagée
     private List<SemaphoreTemplate> semaphorespace;  //Liste des semaphores pour les read/take en attente
     private List<CallbackTemplate> callbackspace;    //Liste des Callbacks en attente
-    private Semaphore mutex;   //Utilisé pour que l'accès à la mémoire partagée se fasse par
+    private Semaphore mutex;   
+    private boolean editing;
+    private Integer readerNb = 0;
+    private ReentrantLock monitor;
+    private Condition AP;
+    private Condition SAS;
+    private int counterAP = 0;
+    private int counterSAS = 0;
+    private ForkJoinPool pool = new ForkJoinPool();
+
+
+    //Utilisé pour que l'accès à la mémoire partagée se fasse par
     //un seul thread en même temps
-    private ExecutorService poule;
+
 
 	
     public CentralizedLinda() {
@@ -26,17 +39,40 @@ public class CentralizedLinda implements Linda {
         this.semaphorespace = new ArrayList<>();
         this.callbackspace = new ArrayList<>();
         this.mutex = new Semaphore(1);
-        this.poule = Executors.newFixedThreadPool(4);
+        this.editing = false;
+        this.monitor = new ReentrantLock();
+        this.AP = monitor.newCondition();
+        this.SAS = monitor.newCondition();
     }
 
     @Override
     public void write(Tuple t) {
-        try {
-            mutex.acquire();
-        } catch (InterruptedException e) {} 
         //On va accéder à la mémoire partagée donc on bloque toute autre intéraction
-        //pouvant être effectuée dessus par un autre thread
+        //pouvant être effectuée dessus par un autre thread d
 
+        if(!(!editing && readerNb== 0 && counterAP == 0 && counterSAS == 0)) {
+            try {
+                monitor.lock();
+                counterAP++;
+                AP.await();
+                counterAP--;
+                monitor.unlock();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+            if(readerNb > 0) {
+            try {
+                monitor.lock();
+                counterSAS++;
+                SAS.await();
+                counterSAS--;
+                monitor.unlock();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+        editing = true;
         Integer size = t.size();
         if (this.tuplespace.containsKey(size)) {
             this.tuplespace.get(size).add(t);
@@ -88,19 +124,37 @@ public class CentralizedLinda implements Linda {
                     it2.remove();
                 }
             }
-                
         }
-
-        mutex.release(); //On laisse les autres thread intéragir avec la mémoire partagée
-               
+        endEdit();
     }
 
 
     @Override
     public Tuple take(Tuple template) {
-        try {
-            mutex.acquire();
-        } catch (InterruptedException e1) {}
+        if(!(!editing && readerNb == 0 && counterAP == 0 && counterSAS == 0)) {
+            try {
+                monitor.lock();
+                counterAP++;
+                AP.await();
+                counterAP--;
+                monitor.unlock();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+            if(readerNb > 0) {
+            try {
+                monitor.lock();
+                counterSAS++;
+                SAS.await();
+                counterSAS--;
+                monitor.unlock();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+        editing = true;
+        
 
         Integer size = template.size();
         if (this.tuplespace.containsKey(size)) {
@@ -109,7 +163,7 @@ public class CentralizedLinda implements Linda {
                 Tuple elmt = it.next();
                 if (elmt.matches(template)) {
                     it.remove();
-                    mutex.release();
+                    endEdit();
                     return elmt;
                 }
             }
@@ -119,29 +173,46 @@ public class CentralizedLinda implements Linda {
         //On fait une attente bloquante
         Semaphore s = new Semaphore(0);
         this.semaphorespace.add(new SemaphoreTemplate(s, template, eventMode.TAKE));
-        mutex.release();
-
-        
-        
-
         //Attente bloquante qu'un élément au motif recherche apparaisse dans la mémoire
         try {
+        endEdit();
         s.acquire();
         } 
         catch (InterruptedException e) {
             e.printStackTrace();
         }
 
-        try {
-            mutex.acquire();
-        } catch (InterruptedException e) {}
+        if(!(!editing && readerNb == 0 && counterAP == 0 && counterSAS == 0)) {
+            try {
+                monitor.lock();
+                counterAP++;
+                AP.await();
+                counterAP--;
+                monitor.unlock();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+            if(readerNb > 0) {
+            try {
+                monitor.lock();
+                counterSAS++;
+                SAS.await();
+                counterSAS--;
+                monitor.unlock();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+        editing = true;
+        
 
         Iterator<Tuple> it = this.tuplespace.get(size).iterator();
         while (it.hasNext()) {
             Tuple elmt = it.next();
              if (elmt.matches(template)) {
                 it.remove();
-                mutex.release();
+                endEdit();
                 return elmt;
             }
         }
@@ -150,17 +221,27 @@ public class CentralizedLinda implements Linda {
     }
 
     @Override
-    public Tuple read(Tuple template) {
-        try {
-            mutex.acquire();
-        } catch (InterruptedException e1) {}
+    public  Tuple read(Tuple template) {
+        if (!(!editing && counterAP == 0 && counterSAS == 0)) {
+            try {
+                monitor.lock();
+                counterAP++;
+                AP.await();
+                counterAP--;
+                AP.signal();
+                monitor.unlock();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+        readerNb++;
         Integer size = template.size();
         if (this.tuplespace.containsKey(size)) {
             Iterator<Tuple> it = this.tuplespace.get(size).iterator();
             while (it.hasNext()) {
                 Tuple elmt = it.next();
                 if (elmt.matches(template)) {
-                    mutex.release();
+                    endRead();
                     return elmt;
                 }
             }
@@ -169,28 +250,34 @@ public class CentralizedLinda implements Linda {
        Semaphore s = new Semaphore(0);
        this.semaphorespace.add(new SemaphoreTemplate(s, template, eventMode.READ));
 
-       mutex.release();
-
-        
-
         //Attente bloquante
         try {
+        endRead();
         s.acquire();
         } 
         catch (InterruptedException e) {
             e.printStackTrace();
         }
 
-        //Attente bloquante qu'un élément au motif recherche apparaisse dans la mémoire
-        try {
-            mutex.acquire();
-        } catch (InterruptedException e) {}
+        if (!(!editing && counterAP == 0 && counterSAS == 0)) {
+            try {
+                monitor.lock();
+                counterAP++;
+                AP.await();
+                counterAP--;
+                AP.signal();
+                monitor.unlock();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
 
+        readerNb++;
         Iterator<Tuple> it = this.tuplespace.get(size).iterator();
         while (it.hasNext()) {
             Tuple elmt = it.next();
              if (elmt.matches(template)) {
-                 mutex.release();
+                 endRead();
                  return elmt;
             }
         }
@@ -299,7 +386,7 @@ public class CentralizedLinda implements Linda {
         }
     }
 
-    private void callbackCheck(CallbackTemplate ct) {
+    private synchronized void callbackCheck(CallbackTemplate ct) {
         Integer size = ct.getTuple().size();
         if (this.tuplespace.containsKey(size)) {
             Iterator<Tuple> it = this.tuplespace.get(size).iterator();
@@ -323,35 +410,43 @@ public class CentralizedLinda implements Linda {
         if (prefix.equals("callback")){
             for(CallbackTemplate t: callbackspace)
             {
-                System.out.println (t.getTuple());
+                //System.out.println (t.getTuple());
             }
         }
         else{
-            System.out.println(tuplespace);
+            //System.out.println(tuplespace);
         }
         
     }
 
-}
-
-class RechercheTuple implements Callable<Tuple> {
-    // pool fixe
-    private List<Tuple> tuplespace;
-    private Tuple template;
-
-    public RechercheTuple(Tuple template, List<Tuple> t) {
-       this.tuplespace = t;
-       this.template = template;
-    }
-
-    public Tuple call() {
-        Iterator<Tuple> it = this.tuplespace.iterator();
-        while (it.hasNext()) {
-            Tuple elmt = it.next();
-            if (elmt.matches(template)) {
-                return elmt;
+    public void endRead() {
+        monitor.lock();
+        readerNb--;
+        if (readerNb == 0) {
+            if (counterSAS > 0) {
+                //System.out.println("SAS signal");
+                SAS.signal();           
+            } else {
+                //System.out.println("AP signal");
+                AP.signal();
             }
         }
-    return null;
+        monitor.unlock();
+        //System.out.println("End read");
     }
+
+    public void endEdit() {
+        monitor.lock();
+        editing = false;
+        AP.signal();
+        monitor.unlock();
+        //System.out.println("End edit");
+    }
+
+    
+
+
+
+
 }
+
